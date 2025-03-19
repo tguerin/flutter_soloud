@@ -5,6 +5,7 @@
 // ignore_for_file: omit_local_variable_types,public_member_api_docs
 
 import 'dart:ffi' as ffi;
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -70,6 +71,31 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     ffi.Pointer<T> Function<T extends ffi.NativeType>(String symbolName) lookup,
   ) : _lookup = lookup;
 
+  // On Windows, queue up pointers for freeing so we don’t block in a callback.
+  final List<ffi.Pointer<ffi.Void>> _pendingFrees = [];
+
+  // ---------------------------------------------------------------------------
+  // Queue-based free for Windows to avoid deadlock
+  // ---------------------------------------------------------------------------
+  void _scheduleFree(ffi.Pointer<ffi.Void> pointer) {
+    if (pointer == ffi.nullptr) return;
+    if (Platform.isWindows) {
+      _pendingFrees.add(pointer);
+    } else {
+      // On non-Windows, we just free immediately
+      _nativeFree(pointer);
+    }
+  }
+
+  /// Call this in `deinit()` (or whenever you’re sure the engine is idle) to
+  /// free any Windows pointers that were queued during the callbacks.
+  void _drainPendingFrees() {
+    for (final ptr in _pendingFrees) {
+      _nativeFree(ptr);
+    }
+    _pendingFrees.clear();
+  }
+
   // ////////////////////////////////////////////////
   // Callbacks impl
   // ////////////////////////////////////////////////
@@ -79,7 +105,7 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     voiceEndedEventController.add(handle.value);
     // Must free a pointer made on cpp. On Windows this must be freed
     // there and cannot use `calloc.free(...)`
-    nativeFree(handle.cast<ffi.Void>());
+    _scheduleFree(handle.cast<ffi.Void>());
   }
 
   ///
@@ -100,32 +126,40 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
     fileLoadedEventsController.add(result);
     // Must free a pointer made on cpp. On Windows this must be freed
     // there and cannot use `calloc.free(...)`
-    nativeFree(error.cast<ffi.Void>());
-    nativeFree(completeFileName.cast<ffi.Void>());
-    nativeFree(hash.cast<ffi.Void>());
+    _scheduleFree(error.cast<ffi.Void>());
+    _scheduleFree(completeFileName.cast<ffi.Void>());
+    _scheduleFree(hash.cast<ffi.Void>());
   }
 
   void _stateChangedCallback(ffi.Pointer<ffi.Int32> state) {
     final s = PlayerStateNotification.values[state.value];
     // Must free a pointer made on cpp. On Windows this must be freed
     // there and cannot use `calloc.free(state)`
-    nativeFree(state.cast<ffi.Void>());
+    _scheduleFree(state.cast<ffi.Void>());
     _log.finest(() => 'STATE CHANGED EVENT state: $s');
     stateChangedController.add(s);
   }
 
+  late final ffi.NativeCallable<ffi.Void Function(ffi.Pointer<ffi.UnsignedInt>)>
+      nativeVoiceEndedCallable;
+  late final ffi.NativeCallable<
+      ffi.Void Function(ffi.Pointer<ffi.Int32>, ffi.Pointer<ffi.Char>,
+          ffi.Pointer<ffi.UnsignedInt>)> nativeFileLoadedCallable;
+  late final ffi.NativeCallable<ffi.Void Function(ffi.Pointer<ffi.Int32>)>
+      nativeStateChangedCallable;
+
   @override
   Future<void> setDartEventCallbacks() async {
     // Create a NativeCallable for the Dart functions
-    final nativeVoiceEndedCallable =
+    nativeVoiceEndedCallable =
         ffi.NativeCallable<DartVoiceEndedCallbackTFunction>.listener(
       _voiceEndedCallback,
     );
-    final nativeFileLoadedCallable =
+    nativeFileLoadedCallable =
         ffi.NativeCallable<DartFileLoadedCallbackTFunction>.listener(
       _fileLoadedCallback,
     );
-    final nativeStateChangedCallable =
+    nativeStateChangedCallable =
         ffi.NativeCallable<DartStateChangedCallbackTFunction>.listener(
       _stateChangedCallback,
     );
@@ -303,7 +337,12 @@ class FlutterSoLoudFfi extends FlutterSoLoud {
 
   @override
   void deinit() {
-    return _dispose();
+    _drainPendingFrees();
+    _dispose();
+    // Now it’s safe to free the NativeCallables:
+    nativeVoiceEndedCallable.close();
+    nativeFileLoadedCallable.close();
+    nativeStateChangedCallable.close();
   }
 
   late final _disposePtr =
